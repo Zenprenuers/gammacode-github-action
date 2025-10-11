@@ -6,8 +6,6 @@ import * as core from "@actions/core"
 import * as github from "@actions/github"
 import type { Context as GitHubContext } from "@actions/github/lib/context"
 import type { IssueCommentEvent } from "@octokit/webhooks-types"
-import { createOpencodeClient } from "@opencode-ai/sdk"
-import { spawn } from "node:child_process"
 
 type GitHubAuthor = {
   login: string
@@ -112,21 +110,23 @@ type IssueQueryResponse = {
   }
 }
 
-const { client, server } = createOpencode()
 let accessToken: string
 let octoRest: Octokit
 let octoGraph: typeof graphql
 let commentId: number
 let gitConfig: string
-let session: { id: string; title: string; version: string }
-let shareId: string | undefined
 let exitCode = 0
 type PromptFiles = Awaited<ReturnType<typeof getUserPrompt>>["promptFiles"]
 
 try {
   assertContextEvent("issue_comment")
   assertPayloadKeyword()
-  await assertOpencodeConnected()
+
+  // Validate API key is provided
+  const apiKey = useEnvApiKey()
+  if (!apiKey) {
+    throw new Error("GAMMACODE_API_KEY environment variable is required")
+  }
 
   accessToken = await getAccessToken()
   octoRest = new Octokit({ auth: accessToken })
@@ -141,47 +141,43 @@ try {
   const comment = await createComment()
   commentId = comment.data.id
 
-  // Setup opencode session
-  const repoData = await fetchRepo()
-  session = await client.session.create<true>().then((r) => r.data)
-  await subscribeSessionEvents()
-  shareId = await (async () => {
-    if (useEnvShare() === false) return
-    if (!useEnvShare() && repoData.data.private) return
-    await client.session.share<true>({ path: session })
-    return session.id.slice(-8)
-  })()
-  console.log("opencode session", session.id)
-
-  // Handle 3 cases
-  // 1. Issue
-  // 2. Local PR
-  // 3. Fork PR
+  // Handle 3 cases: Issue, Local PR, Fork PR
   if (isPullRequest()) {
     const prData = await fetchPR()
+
     // Local PR
     if (prData.headRepository.nameWithOwner === prData.baseRepository.nameWithOwner) {
       await checkoutLocalBranch(prData)
       const dataPrompt = buildPromptDataForPR(prData)
-      const response = await chat(`${userPrompt}\n\n${dataPrompt}`, promptFiles)
+      const response = await runGammaCode(
+        `${userPrompt}
+
+${dataPrompt}`,
+        promptFiles,
+        apiKey,
+      )
       if (await branchIsDirty()) {
-        const summary = await summarize(response)
+        const summary = await summarizeChanges(response)
         await pushToLocalBranch(summary)
       }
-      const hasShared = prData.comments.nodes.some((c) => c.body.includes(`${useShareUrl()}/s/${shareId}`))
-      await updateComment(`${response}${footer({ image: !hasShared })}`)
+      await updateComment(`${response}${footer()}`)
     }
     // Fork PR
     else {
       await checkoutForkBranch(prData)
       const dataPrompt = buildPromptDataForPR(prData)
-      const response = await chat(`${userPrompt}\n\n${dataPrompt}`, promptFiles)
+      const response = await runGammaCode(
+        `${userPrompt}
+
+${dataPrompt}`,
+        promptFiles,
+        apiKey,
+      )
       if (await branchIsDirty()) {
-        const summary = await summarize(response)
+        const summary = await summarizeChanges(response)
         await pushToForkBranch(summary, prData)
       }
-      const hasShared = prData.comments.nodes.some((c) => c.body.includes(`${useShareUrl()}/s/${shareId}`))
-      await updateComment(`${response}${footer({ image: !hasShared })}`)
+      await updateComment(`${response}${footer()}`)
     }
   }
   // Issue
@@ -189,19 +185,27 @@ try {
     const branch = await checkoutNewBranch()
     const issueData = await fetchIssue()
     const dataPrompt = buildPromptDataForIssue(issueData)
-    const response = await chat(`${userPrompt}\n\n${dataPrompt}`, promptFiles)
+    const response = await runGammaCode(
+      `${userPrompt}
+
+${dataPrompt}`,
+      promptFiles,
+      apiKey,
+    )
     if (await branchIsDirty()) {
-      const summary = await summarize(response)
+      const summary = await summarizeChanges(response)
       await pushToNewBranch(summary, branch)
       const pr = await createPR(
-        repoData.data.default_branch,
+        (await fetchRepo()).data.default_branch,
         branch,
         summary,
-        `${response}\n\nCloses #${useIssueId()}${footer({ image: true })}`,
+        `${response}
+
+Closes #${useIssueId()}${footer()}`,
       )
-      await updateComment(`Created PR #${pr}${footer({ image: true })}`)
+      await updateComment(`Created PR #${pr}${footer()}`)
     } else {
-      await updateComment(`${response}${footer({ image: true })}`)
+      await updateComment(`${response}${footer()}`)
     }
   }
 } catch (e: any) {
@@ -213,27 +217,65 @@ try {
   } else if (e instanceof Error) {
     msg = e.message
   }
-  await updateComment(`${msg}${footer()}`)
+  await updateComment(`❌ Error: ${msg}${footer()}`)
   core.setFailed(msg)
-  // Also output the clean error message for the action to capture
-  //core.setOutput("prepare_error", e.message);
 } finally {
-  server.close()
   await restoreGitConfig()
   await revokeAppToken()
 }
 process.exit(exitCode)
 
-function createOpencode() {
-  const host = "127.0.0.1"
-  const port = 4096
-  const url = `http://${host}:${port}`
-  const proc = spawn(`opencode`, [`serve`, `--hostname=${host}`, `--port=${port}`])
-  const client = createOpencodeClient({ baseUrl: url })
+async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: string): Promise<string> {
+  console.log("Running GammaCode with API key authentication...")
 
-  return {
-    server: { url, close: () => proc.kill() },
-    client,
+  // Create temporary files for any attachments
+  const tempFiles: string[] = []
+  try {
+    // Handle file attachments if any
+    for (const file of files) {
+      const tempPath = `/tmp/${file.filename}`
+      await Bun.write(tempPath, Buffer.from(file.content, "base64"))
+      tempFiles.push(tempPath)
+      // Replace file references in prompt
+      prompt = prompt.replace(file.replacement, `@${tempPath}`)
+    }
+
+    // Run gammacode with API key
+    const result = await $`gammacode run ${prompt} ${apiKey}`.text()
+
+    console.log("GammaCode execution completed successfully")
+    return result.trim()
+  } catch (error) {
+    console.error("GammaCode execution failed:", error)
+    if (error instanceof $.ShellError) {
+      const stderr = error.stderr.toString()
+      const stdout = error.stdout.toString()
+
+      // Check for specific API key errors
+      if (stderr.includes("API key authentication failed")) {
+        throw new Error("Invalid or expired GammaCode API key. Please check your API key in repository secrets.")
+      }
+      if (stderr.includes("Headless mode with API keys is only available for Pro subscribers")) {
+        throw new Error("GammaCode API key authentication requires a Pro subscription. Please upgrade your account.")
+      }
+      if (stderr.includes("API key does not have required 'cli:auth' permission")) {
+        throw new Error(
+          "API key lacks required permissions. Please regenerate your API key with 'cli:auth' permission.",
+        )
+      }
+
+      throw new Error(`GammaCode failed: ${stderr || stdout || "Unknown error"}`)
+    }
+    throw error
+  } finally {
+    // Cleanup temporary files
+    for (const tempFile of tempFiles) {
+      try {
+        await $`rm -f ${tempFile}`
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
   }
 }
 
@@ -245,23 +287,6 @@ function assertPayloadKeyword() {
   }
 }
 
-async function assertOpencodeConnected() {
-  let retry = 0
-  let connected = false
-  do {
-    try {
-      await client.app.get<true>()
-      connected = true
-      break
-    } catch (e) {}
-    await new Promise((resolve) => setTimeout(resolve, 300))
-  } while (retry++ < 30)
-
-  if (!connected) {
-    throw new Error("Failed to connect to opencode server")
-  }
-}
-
 function assertContextEvent(...events: string[]) {
   const context = useContext()
   if (!events.includes(context.eventName)) {
@@ -270,33 +295,12 @@ function assertContextEvent(...events: string[]) {
   return context
 }
 
-function useEnvModel() {
-  const value = process.env["MODEL"]
-  if (!value) throw new Error(`Environment variable "MODEL" is not set`)
-
-  const [providerID, ...rest] = value.split("/")
-  const modelID = rest.join("/")
-
-  if (!providerID?.length || !modelID.length)
-    throw new Error(`Invalid model ${value}. Model must be in the format "provider/model".`)
-  return { providerID, modelID }
+function useEnvApiKey() {
+  return process.env["GAMMACODE_API_KEY"]
 }
 
-function useEnvRunUrl() {
-  const { repo } = useContext()
-
-  const runId = process.env["GITHUB_RUN_ID"]
-  if (!runId) throw new Error(`Environment variable "GITHUB_RUN_ID" is not set`)
-
-  return `/${repo.owner}/${repo.repo}/actions/runs/${runId}`
-}
-
-function useEnvShare() {
-  const value = process.env["SHARE"]
-  if (!value) return undefined
-  if (value === "true") return true
-  if (value === "false") return false
-  throw new Error(`Invalid share value: ${value}. Share must be a boolean.`)
+function useEnvGithubToken() {
+  return process.env["TOKEN"]
 }
 
 function useEnvMock() {
@@ -304,10 +308,6 @@ function useEnvMock() {
     mockEvent: process.env["MOCK_EVENT"],
     mockToken: process.env["MOCK_TOKEN"],
   }
-}
-
-function useEnvGithubToken() {
-  return process.env["TOKEN"]
 }
 
 function isMock() {
@@ -328,10 +328,6 @@ function useContext() {
 function useIssueId() {
   const payload = useContext().payload as IssueCommentEvent
   return payload.issue.number
-}
-
-function useShareUrl() {
-  return isMock() ? "https://dev.opencode.ai" : "https://opencode.ai"
 }
 
 async function getAccessToken() {
@@ -378,7 +374,7 @@ async function createComment() {
     owner: repo.owner,
     repo: repo.repo,
     issue_number: useIssueId(),
-    body: `[Working...](${useEnvRunUrl()})`,
+    body: `🤖 GammaCode is working on this...`,
   })
 }
 
@@ -391,7 +387,7 @@ async function getUserPrompt() {
     throw new Error("Comments must mention `/gammacode` or `/gc`")
   })()
 
-  // Handle images
+  // Handle images and file attachments
   const imgData: {
     filename: string
     mime: string
@@ -401,14 +397,10 @@ async function getUserPrompt() {
     replacement: string
   }[] = []
 
-  // Search for files
-  // ie. <img alt="Image" src="https://github.com/user-attachments/assets/xxxx" />
-  // ie. [api.json](https://github.com/user-attachments/files/21433810/api.json)
-  // ie. ![Image](https://github.com/user-attachments/assets/xxxx)
+  // Search for files (images and attachments)
   const mdMatches = prompt.matchAll(/!?\[.*?\]\((https:\/\/github\.com\/user-attachments\/[^)]+)\)/gi)
   const tagMatches = prompt.matchAll(/<img .*?src="(https:\/\/github\.com\/user-attachments\/[^"]+)" \/>/gi)
   const matches = [...mdMatches, ...tagMatches].sort((a, b) => a.index - b.index)
-  console.log("Images", JSON.stringify(matches, null, 2))
 
   let offset = 0
   for (const m of matches) {
@@ -419,7 +411,7 @@ async function getUserPrompt() {
     if (!url) continue
     const filename = path.basename(url)
 
-    // Download image
+    // Download attachment
     const res = await fetch(url, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -427,11 +419,11 @@ async function getUserPrompt() {
       },
     })
     if (!res.ok) {
-      console.error(`Failed to download image: ${url}`)
+      console.error(`Failed to download attachment: ${url}`)
       continue
     }
 
-    // Replace img tag with file path, ie. @image.png
+    // Replace with file reference
     const replacement = `@${filename}`
     prompt = prompt.slice(0, start + offset) + replacement + prompt.slice(start + offset + tag.length)
     offset += replacement.length - tag.length
@@ -449,139 +441,14 @@ async function getUserPrompt() {
   return { userPrompt: prompt, promptFiles: imgData }
 }
 
-async function subscribeSessionEvents() {
-  console.log("Subscribing to session events...")
-
-  const TOOL: Record<string, [string, string]> = {
-    todowrite: ["Todo", "\x1b[33m\x1b[1m"],
-    todoread: ["Todo", "\x1b[33m\x1b[1m"],
-    bash: ["Bash", "\x1b[31m\x1b[1m"],
-    edit: ["Edit", "\x1b[32m\x1b[1m"],
-    glob: ["Glob", "\x1b[34m\x1b[1m"],
-    grep: ["Grep", "\x1b[34m\x1b[1m"],
-    list: ["List", "\x1b[34m\x1b[1m"],
-    read: ["Read", "\x1b[35m\x1b[1m"],
-    write: ["Write", "\x1b[32m\x1b[1m"],
-    websearch: ["Search", "\x1b[2m\x1b[1m"],
-  }
-
-  const response = await fetch(`${server.url}/event`)
-  if (!response.body) throw new Error("No response body")
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-
-  let text = ""
-  ;(async () => {
-    while (true) {
-      try {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        const chunk = decoder.decode(value, { stream: true })
-        const lines = chunk.split("\n")
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue
-
-          const jsonStr = line.slice(6).trim()
-          if (!jsonStr) continue
-
-          try {
-            const evt = JSON.parse(jsonStr)
-
-            if (evt.type === "message.part.updated") {
-              if (evt.properties.part.sessionID !== session.id) continue
-              const part = evt.properties.part
-
-              if (part.type === "tool" && part.state.status === "completed") {
-                const [tool, color] = TOOL[part.tool] ?? [part.tool, "\x1b[34m\x1b[1m"]
-                const title =
-                  part.state.title || Object.keys(part.state.input).length > 0
-                    ? JSON.stringify(part.state.input)
-                    : "Unknown"
-                console.log()
-                console.log(color + `|`, "\x1b[0m\x1b[2m" + ` ${tool.padEnd(7, " ")}`, "", "\x1b[0m" + title)
-              }
-
-              if (part.type === "text") {
-                text = part.text
-
-                if (part.time?.end) {
-                  console.log()
-                  console.log(text)
-                  console.log()
-                  text = ""
-                }
-              }
-            }
-
-            if (evt.type === "session.updated") {
-              if (evt.properties.info.id !== session.id) continue
-              session = evt.properties.info
-            }
-          } catch (e) {
-            // Ignore parse errors
-          }
-        }
-      } catch (e) {
-        console.log("Subscribing to session events done", e)
-        break
-      }
-    }
-  })()
-}
-
-async function summarize(response: string) {
+async function summarizeChanges(response: string) {
   const payload = useContext().payload as IssueCommentEvent
-  try {
-    return await chat(`Summarize the following in less than 40 characters:\n\n${response}`)
-  } catch (e) {
-    return `Fix issue: ${payload.issue.title}`
+  // For now, just use a simple summary. In the future, we could ask GammaCode to summarize
+  const firstLine = response.split("\n")[0]
+  if (firstLine && firstLine.length < 50) {
+    return firstLine
   }
-}
-
-async function chat(text: string, files: PromptFiles = []) {
-  console.log("Sending message to opencode...")
-  const { providerID, modelID } = useEnvModel()
-
-  const chat = await client.session.chat<true>({
-    path: session,
-    body: {
-      providerID,
-      modelID,
-      agent: "build",
-      parts: [
-        {
-          type: "text",
-          text,
-        },
-        ...files.flatMap((f) => [
-          {
-            type: "file" as const,
-            mime: f.mime,
-            url: `data:${f.mime};base64,${f.content}`,
-            filename: f.filename,
-            source: {
-              type: "file" as const,
-              text: {
-                value: f.replacement,
-                start: f.start,
-                end: f.end,
-              },
-              path: f.filename,
-            },
-          },
-        ]),
-      ],
-    },
-  })
-
-  // @ts-ignore
-  const match = chat.data.parts.findLast((p) => p.type === "text")
-  if (!match) throw new Error("Failed to parse the text response")
-
-  return match.text
+  return `Fix issue: ${payload.issue.title.substring(0, 40)}...`
 }
 
 async function configureGit(appToken: string) {
@@ -597,8 +464,8 @@ async function configureGit(appToken: string) {
 
   await $`git config --local --unset-all ${config}`
   await $`git config --local ${config} "AUTHORIZATION: basic ${newCredentials}"`
-  await $`git config --global user.name "GammaCode-IH[bot]"`
-  await $`git config --global user.email "GammaCode-IH[bot]@users.noreply.github.com"`
+  await $`git config --global user.name "GammaCode[bot]"`
+  await $`git config --global user.email "GammaCode[bot]@users.noreply.github.com"`
 }
 
 async function restoreGitConfig() {
@@ -644,7 +511,7 @@ function generateBranchName(type: "issue" | "pr") {
     .replace(/\.\d{3}Z/, "")
     .split("T")
     .join("")
-  return `opencode/${type}${useIssueId()}-${timestamp}`
+  return `gammacode/${type}${useIssueId()}-${timestamp}`
 }
 
 async function pushToNewBranch(summary: string, branch: string) {
@@ -744,20 +611,12 @@ async function createPR(base: string, branch: string, title: string, body: strin
   return pr.data.number
 }
 
-function footer(opts?: { image?: boolean }) {
-  const { providerID, modelID } = useEnvModel()
+function footer() {
+  const runUrl = `/${useContext().repo.owner}/${useContext().repo.repo}/actions/runs/${process.env["GITHUB_RUN_ID"]}`
+  return `
 
-  const image = (() => {
-    if (!shareId) return ""
-    if (!opts?.image) return ""
-
-    const titleAlt = encodeURIComponent(session.title.substring(0, 50))
-    const title64 = Buffer.from(session.title.substring(0, 700), "utf8").toString("base64")
-
-    return `<a href="${useShareUrl()}/s/${shareId}"><img width="200" alt="${titleAlt}" src="https://social-cards.sst.dev/opencode-share/${title64}.png?model=${providerID}/${modelID}&version=${session.version}&id=${shareId}" /></a>\n`
-  })()
-  const shareUrl = shareId ? `[opencode session](${useShareUrl()}/s/${shareId})&nbsp;&nbsp;|&nbsp;&nbsp;` : ""
-  return `\n\n${image}${shareUrl}[github run](${useEnvRunUrl()})`
+---
+*Powered by [GammaCode](https://gammacode.dev) • [View run](${runUrl})*`
 }
 
 async function fetchRepo() {

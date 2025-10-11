@@ -1,17 +1,18 @@
 name: "GammaCode GitHub Action"
-description: "Run GammaCode in GitHub Actions workflows"
+description: "Run GammaCode AI assistant in GitHub Actions workflows"
 branding:
   icon: "code"
   color: "orange"
 
 inputs:
-  model:
-    description: "The model to use with GammaCode. Takes the format of `provider/model`."
+  api-key:
+    description: "GammaCode API key for authentication (Pro subscription required). Get your API key from https://app.gammacode.dev/settings"
     required: true
 
   share:
     description: "Whether to share the GammaCode session. Defaults to true for public repositories."
     required: false
+    default: "true"
 
   token:
     description: "Optional GitHub access token for performing operations such as creating comments, committing changes, and opening pull requests. Defaults to the installation access token from the GammaCode-IH GitHub App."
@@ -20,9 +21,9 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install opencode
+    - name: Install GammaCode
       shell: bash
-      run: curl -fsSL https://opencode.ai/install | bash
+      run: curl -fsSL https://install.gammacode.dev | bash
 
     - name: Install bun
       shell: bash
@@ -34,10 +35,10 @@ runs:
         cd ${GITHUB_ACTION_PATH}
         bun install
 
-    - name: Run opencode
+    - name: Run GammaCode
       shell: bash
       run: bun ${GITHUB_ACTION_PATH}/index.ts
       env:
-        MODEL: ${{ inputs.model }}
+        GAMMACODE_API_KEY: ${{ inputs.api-key }}
         SHARE: ${{ inputs.share }}
         TOKEN: ${{ inputs.token }}

@@ -1,0 +1,25 @@
+name: GammaCode AI Assistant
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  gammacode:
+    if: contains(github.event.comment.body, '/gammacode') || contains(github.event.comment.body, '/gc')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run GammaCode
+        uses: Zenprenuers/gammacode-github-action@main
+        with:
+          api-key: ${{ secrets.GAMMACODE_API_KEY }}
+          share: true
