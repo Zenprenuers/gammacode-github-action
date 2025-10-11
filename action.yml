@@ -23,7 +23,7 @@ runs:
   steps:
     - name: Install GammaCode
       shell: bash
-      run: curl -fsSL https://install.gammacode.dev | bash
+      run: curl -fsSL https://github.com/Zenprenuers/GammaCode-Releases/releases/download/v1.0.15/install | bash
 
     - name: Install bun
       shell: bash
