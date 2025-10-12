@@ -263,7 +263,7 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
       prompt = prompt.replace(file.replacement, `@${tempPath}`)
     }
 
-    console.log("🔑 Running GammaCode with API key authentication...")
+    console.log("🤖 Starting GammaCode analysis...")
 
     // Setup timeout (15 minutes max)
     const TIMEOUT_MS = 15 * 60 * 1000
@@ -291,9 +291,11 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
         },
       })
 
-      // Stream stdout in real-time
+      // Stream stdout and parse for clean AI responses only
       const decoder = new TextDecoder()
       const reader = proc.stdout.getReader()
+      let buffer = ""
+      let lastTextOutput = ""
 
       const readStream = async () => {
         try {
@@ -302,32 +304,53 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
             if (done) break
 
             const chunk = decoder.decode(value, { stream: true })
-            process.stdout.write(chunk) // Output to GitHub Action logs
+            buffer += chunk
 
-            // Parse JSON events for better logging
-            const lines = chunk.split("\n").filter((line) => line.trim())
+            // Process complete JSON lines
+            const lines = buffer.split("\n")
+            buffer = lines.pop() || "" // Keep incomplete line in buffer
+
             for (const line of lines) {
+              if (!line.trim()) continue
+
               try {
                 const event = JSON.parse(line)
-                if (event.type === "tool_use") {
-                  console.log(`🔧 Using tool: ${event.part?.tool || "unknown"}`)
-                  if (event.part?.state?.title) {
-                    console.log(`   └─ ${event.part.state.title}`)
-                  }
-                }
+
+                // Only show AI text responses
                 if (event.type === "text" && event.text) {
-                  fullOutput += event.text
-                  // Show progress for long responses
-                  if (event.text.length > 100) {
-                    console.log(`💭 Generated ${event.text.length} characters of response...`)
+                  const newText = event.text
+                  fullOutput += newText
+
+                  // Output clean AI response (strip ANSI codes)
+                  const cleanText = newText.replace(/\x1b\[[0-9;]*[mGKHF]/g, "")
+                  if (cleanText !== lastTextOutput && cleanText.trim()) {
+                    console.log(cleanText)
+                    lastTextOutput = cleanText
                   }
                 }
+
+                // Show minimal tool usage for transparency
+                if (event.type === "tool_use" && event.part?.tool) {
+                  const tool = event.part.tool
+                  if (["edit", "write", "read"].includes(tool)) {
+                    const file = event.part.state?.input?.filePath || event.part.state?.title || ""
+                    if (file) {
+                      const fileName = file.split("/").pop() || file
+                      console.log(`📝 ${tool}: ${fileName}`)
+                    }
+                  }
+                }
+
+                // Show errors clearly
                 if (event.type === "error") {
                   console.error(`❌ Error: ${event.error?.message || "Unknown error"}`)
                 }
               } catch {
-                // Not JSON, probably regular output - append to full output
-                fullOutput += chunk
+                // Not JSON - might be regular output, add to full output
+                if (line.trim() && !line.includes("🚀") && !line.includes("STDERR:")) {
+                  fullOutput += line + "\n"
+                  process.stdout.write(line + "\n")
+                }
               }
             }
           }
@@ -346,7 +369,15 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
             if (done) break
 
             const chunk = decoder.decode(value, { stream: true })
-            console.error("STDERR:", chunk)
+            // Only log important stderr messages, not debug info
+            if (
+              !chunk.includes("Running in run mode") &&
+              !chunk.includes("Validating API key") &&
+              !chunk.includes("Authenticated as") &&
+              !chunk.includes("Edit operations automatically allowed")
+            ) {
+              console.error("STDERR:", chunk)
+            }
 
             // Check for specific error patterns
             if (chunk.includes("API key authentication failed")) {
