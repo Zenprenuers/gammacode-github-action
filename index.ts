@@ -317,15 +317,24 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
                 const event = JSON.parse(line)
 
                 // Only show AI text responses
-                if (event.type === "text" && event.text) {
-                  const newText = event.text
-                  fullOutput += newText
+                if (event.type === "text") {
+                  // Handle both direct text and nested text object
+                  let textContent = ""
+                  if (typeof event.text === "string") {
+                    textContent = event.text
+                  } else if (event.text && typeof event.text === "object" && event.text.text) {
+                    textContent = event.text.text
+                  }
 
-                  // Output clean AI response (strip ANSI codes)
-                  const cleanText = newText.replace(/\x1b\[[0-9;]*[mGKHF]/g, "")
-                  if (cleanText !== lastTextOutput && cleanText.trim()) {
-                    console.log(cleanText)
-                    lastTextOutput = cleanText
+                  if (textContent) {
+                    fullOutput += textContent
+
+                    // Output clean AI response (strip ANSI codes)
+                    const cleanText = textContent.replace(/\x1b\[[0-9;]*[mGKHF]/g, "")
+                    if (cleanText !== lastTextOutput && cleanText.trim()) {
+                      console.log(cleanText)
+                      lastTextOutput = cleanText
+                    }
                   }
                 }
 
@@ -347,9 +356,18 @@ async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: str
                 }
               } catch {
                 // Not JSON - might be regular output, add to full output
-                if (line.trim() && !line.includes("🚀") && !line.includes("STDERR:")) {
-                  fullOutput += line + "\n"
-                  process.stdout.write(line + "\n")
+                const cleanLine = line.replace(/\x1b\[[0-9;]*[mGKHF]/g, "").trim()
+
+                // Skip debug lines, ANSI codes, and tool output headers
+                if (
+                  cleanLine &&
+                  !cleanLine.includes("🚀") &&
+                  !cleanLine.includes("STDERR:") &&
+                  !cleanLine.match(/^\|\s+\w+\s+/) && // Skip "| Read    filename" style lines
+                  !cleanLine.match(/^[|│]\s/) // Skip any pipe/box drawing characters
+                ) {
+                  fullOutput += cleanLine + "\n"
+                  console.log(cleanLine)
                 }
               }
             }
