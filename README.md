@@ -7,7 +7,7 @@ Integrate GammaCode AI assistant into your GitHub workflows for automated issue 
 ### Prerequisites
 
 - **Pro Subscription**: API key authentication requires a GammaCode Pro subscription
-- **API Key**: Generate your API key from [GammaCode Settings](https://app.gammacode.dev/settings)
+- **API Key**: Generate your API key from [GammaCode Profile](https://gammacode.dev/profile)
 
 ### 1. Add API Key to Repository Secrets
 
@@ -33,6 +33,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
+      id-token: write
       contents: write
       issues: write
       pull-requests: write
