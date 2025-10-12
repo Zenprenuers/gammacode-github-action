@@ -147,7 +147,10 @@ try {
 
     // Local PR
     if (prData.headRepository.nameWithOwner === prData.baseRepository.nameWithOwner) {
+      await updateComment(`🤖 Setting up local branch for PR...${footer()}`)
       await checkoutLocalBranch(prData)
+
+      await updateComment(`🧠 Analyzing PR data and running GammaCode...${footer()}`)
       const dataPrompt = buildPromptDataForPR(prData)
       const response = await runGammaCode(
         `${userPrompt}
@@ -156,7 +159,9 @@ ${dataPrompt}`,
         promptFiles,
         apiKey,
       )
+
       if (await branchIsDirty()) {
+        await updateComment(`💾 Committing changes to branch...${footer()}`)
         const summary = await summarizeChanges(response)
         await pushToLocalBranch(summary)
       }
@@ -164,7 +169,10 @@ ${dataPrompt}`,
     }
     // Fork PR
     else {
+      await updateComment(`🔀 Setting up fork branch for PR...${footer()}`)
       await checkoutForkBranch(prData)
+
+      await updateComment(`🧠 Analyzing fork PR data and running GammaCode...${footer()}`)
       const dataPrompt = buildPromptDataForPR(prData)
       const response = await runGammaCode(
         `${userPrompt}
@@ -173,7 +181,9 @@ ${dataPrompt}`,
         promptFiles,
         apiKey,
       )
+
       if (await branchIsDirty()) {
+        await updateComment(`📤 Pushing changes to fork...${footer()}`)
         const summary = await summarizeChanges(response)
         await pushToForkBranch(summary, prData)
       }
@@ -182,8 +192,11 @@ ${dataPrompt}`,
   }
   // Issue
   else {
+    await updateComment(`🌿 Creating new branch for issue...${footer()}`)
     const branch = await checkoutNewBranch()
     const issueData = await fetchIssue()
+
+    await updateComment(`🧠 Analyzing issue data and running GammaCode...${footer()}`)
     const dataPrompt = buildPromptDataForIssue(issueData)
     const response = await runGammaCode(
       `${userPrompt}
@@ -192,7 +205,9 @@ ${dataPrompt}`,
       promptFiles,
       apiKey,
     )
+
     if (await branchIsDirty()) {
+      await updateComment(`💾 Creating PR with changes...${footer()}`)
       const summary = await summarizeChanges(response)
       await pushToNewBranch(summary, branch)
       const pr = await createPR(
@@ -226,49 +241,161 @@ Closes #${useIssueId()}${footer()}`,
 process.exit(exitCode)
 
 async function runGammaCode(prompt: string, files: PromptFiles = [], apiKey: string): Promise<string> {
-  console.log("Running GammaCode with API key authentication...")
+  console.log("🚀 Starting GammaCode execution...")
+  console.log(`📝 Prompt: ${prompt.substring(0, 100)}${prompt.length > 100 ? "..." : ""}`)
 
   // Create temporary files for any attachments
   const tempFiles: string[] = []
+  let fullOutput = ""
+
   try {
     // Handle file attachments if any
+    if (files.length > 0) {
+      console.log(`📎 Processing ${files.length} file attachment(s)...`)
+    }
+
     for (const file of files) {
       const tempPath = `/tmp/${file.filename}`
       await Bun.write(tempPath, Buffer.from(file.content, "base64"))
       tempFiles.push(tempPath)
+      console.log(`📎 Created temporary file: ${file.filename}`)
       // Replace file references in prompt
       prompt = prompt.replace(file.replacement, `@${tempPath}`)
     }
 
-    // Run gammacode with API key
-    const result = await $`gammacode run ${prompt} ${apiKey}`.text()
+    console.log("🔑 Running GammaCode with API key authentication...")
 
-    console.log("GammaCode execution completed successfully")
+    // Setup timeout (15 minutes max)
+    const TIMEOUT_MS = 15 * 60 * 1000
+    let timeoutId: Timer | null = null
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error("GammaCode execution timed out after 15 minutes"))
+      }, TIMEOUT_MS)
+    })
+
+    // Run gammacode with streaming output
+    const executePromise = new Promise<string>((resolve, reject) => {
+      const proc = Bun.spawn(["gammacode", "run", "--api-key", apiKey, "--format", "json", prompt], {
+        stdout: "pipe",
+        stderr: "pipe",
+        onExit: (proc, exitCode, signalCode) => {
+          if (exitCode === 0) {
+            console.log("✅ GammaCode execution completed successfully")
+            resolve(fullOutput)
+          } else {
+            console.error(`❌ GammaCode exited with code ${exitCode}, signal ${signalCode}`)
+            reject(new Error(`GammaCode exited with code ${exitCode}`))
+          }
+        },
+      })
+
+      // Stream stdout in real-time
+      const decoder = new TextDecoder()
+      const reader = proc.stdout.getReader()
+
+      const readStream = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            const chunk = decoder.decode(value, { stream: true })
+            process.stdout.write(chunk) // Output to GitHub Action logs
+
+            // Parse JSON events for better logging
+            const lines = chunk.split("\n").filter((line) => line.trim())
+            for (const line of lines) {
+              try {
+                const event = JSON.parse(line)
+                if (event.type === "tool_use") {
+                  console.log(`🔧 Using tool: ${event.part?.tool || "unknown"}`)
+                  if (event.part?.state?.title) {
+                    console.log(`   └─ ${event.part.state.title}`)
+                  }
+                }
+                if (event.type === "text" && event.text) {
+                  fullOutput += event.text
+                  // Show progress for long responses
+                  if (event.text.length > 100) {
+                    console.log(`💭 Generated ${event.text.length} characters of response...`)
+                  }
+                }
+                if (event.type === "error") {
+                  console.error(`❌ Error: ${event.error?.message || "Unknown error"}`)
+                }
+              } catch {
+                // Not JSON, probably regular output - append to full output
+                fullOutput += chunk
+              }
+            }
+          }
+        } catch (error) {
+          console.error("Error reading stream:", error)
+          reject(error)
+        }
+      }
+
+      // Stream stderr for error reporting
+      const stderrReader = proc.stderr.getReader()
+      const readStderr = async () => {
+        try {
+          while (true) {
+            const { done, value } = await stderrReader.read()
+            if (done) break
+
+            const chunk = decoder.decode(value, { stream: true })
+            console.error("STDERR:", chunk)
+
+            // Check for specific error patterns
+            if (chunk.includes("API key authentication failed")) {
+              reject(
+                new Error("Invalid or expired GammaCode API key. Please check your API key in repository secrets."),
+              )
+              return
+            }
+            if (chunk.includes("Headless mode with API keys is only available for Pro subscribers")) {
+              reject(
+                new Error("GammaCode API key authentication requires a Pro subscription. Please upgrade your account."),
+              )
+              return
+            }
+            if (chunk.includes("API key does not have required 'cli:auth' permission")) {
+              reject(
+                new Error(
+                  "API key lacks required permissions. Please regenerate your API key with 'cli:auth' permission.",
+                ),
+              )
+              return
+            }
+          }
+        } catch (error) {
+          console.error("Error reading stderr:", error)
+        }
+      }
+
+      // Start reading both streams
+      readStream()
+      readStderr()
+    })
+
+    // Race between execution and timeout
+    const result = await Promise.race([executePromise, timeoutPromise])
+
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+    }
+
     return result.trim()
   } catch (error) {
-    console.error("GammaCode execution failed:", error)
-    if (error instanceof $.ShellError) {
-      const stderr = error.stderr.toString()
-      const stdout = error.stdout.toString()
-
-      // Check for specific API key errors
-      if (stderr.includes("API key authentication failed")) {
-        throw new Error("Invalid or expired GammaCode API key. Please check your API key in repository secrets.")
-      }
-      if (stderr.includes("Headless mode with API keys is only available for Pro subscribers")) {
-        throw new Error("GammaCode API key authentication requires a Pro subscription. Please upgrade your account.")
-      }
-      if (stderr.includes("API key does not have required 'cli:auth' permission")) {
-        throw new Error(
-          "API key lacks required permissions. Please regenerate your API key with 'cli:auth' permission.",
-        )
-      }
-
-      throw new Error(`GammaCode failed: ${stderr || stdout || "Unknown error"}`)
-    }
+    console.error("❌ GammaCode execution failed:", error)
     throw error
   } finally {
     // Cleanup temporary files
+    if (tempFiles.length > 0) {
+      console.log(`🧹 Cleaning up ${tempFiles.length} temporary file(s)...`)
+    }
     for (const tempFile of tempFiles) {
       try {
         await $`rm -f ${tempFile}`
@@ -374,7 +501,11 @@ async function createComment() {
     owner: repo.owner,
     repo: repo.repo,
     issue_number: useIssueId(),
-    body: `🤖 GammaCode is working on this...`,
+    body: `🤖 **GammaCode is working on this...**
+
+⏳ Starting analysis and execution...
+
+You can monitor the progress in the [GitHub Action logs](/${useContext().repo.owner}/${useContext().repo.repo}/actions/runs/${process.env["GITHUB_RUN_ID"]})${footer()}`,
   })
 }
 
